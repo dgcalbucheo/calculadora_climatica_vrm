@@ -1,0 +1,247 @@
+---
+title: "00 · Validación del flujo con CR2MET recortado"
+subtitle: "Calculadora climática Valparaíso + RM — prueba de datos, antes de Shiny"
+lang: es
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Qué valida este notebook
+
+Paso 2 del pipeline (estrategia de datos): el recorte regional de CR2MET ya está en
+`data/raw/cr2met`. Aquí se comprueba, de punta a punta y **sin interfaz**, que ese
+recorte se puede leer, que entrega una serie diaria coherente en un punto conocido
+(Colliguay) y que las métricas de heladas, calor y precipitación se calculan con las
+funciones de `R/`. Si todo pasa, se puede avanzar a modularizar y a Shiny.
+
+```{r}
+#| label: setup
+library(terra)
+library(ggplot2)
+invisible(lapply(list.files(here::here("R"), "\\.R$", full.names = TRUE), source))
+
+par  <- yaml::read_yaml(here::here("parametros.yml"), fileEncoding = "UTF-8")
+dir_cr2met <- here::here(par$rutas$raw, "cr2met")
+lon <- par$punto_control$lon
+lat <- par$punto_control$lat
+ini <- par$periodo$validacion$inicio
+fin <- par$periodo$validacion$fin
+
+# Registro de chequeos (se muestra al final)
+chequeos <- data.frame(chequeo = character(), ok = logical(), detalle = character())
+chequear <- function(chequeo, ok, detalle = "") {
+  chequeos[nrow(chequeos) + 1, ] <<- list(chequeo, isTRUE(ok), detalle)
+  invisible(ok)
+}
+```
+
+## 2. Fuente y limitaciones
+
+| | |
+|---|---|
+| Producto | CR2MET v2.5 — Boisier, J.P. (2023). *CR2MET: A high-resolution precipitation and temperature dataset for the period 1960-2021 in continental Chile* |
+| Origen | Centro de Ciencia del Clima y la Resiliencia (CR2), Universidad de Chile |
+| DOI / licencia | 10.5281/zenodo.7529682 · CC BY 4.0 |
+| Descarga | <https://www.cr2.cl/datos-productos-grillados/> (requiere formulario de registro) y [Zenodo](https://zenodo.org/records/7529681): `CR2MET_pr_v2.5.zip`, `CR2MET_txn_v2.5.zip` |
+| Variables / período | Precipitación diaria, Tmin y Tmax diarias · 1960-01-01 a 2021-12-31 |
+| Resolución | Grilla de 0,05° (~5 km) |
+| Recorte usado | Regiones de Valparaíso y Metropolitana (continente), mismos nombres de archivo que el original |
+
+**Limitaciones a tener presentes:** es un producto grillado construido con modelos
+estadísticos calibrados con estaciones (no es medición directa); a ~5 km no resuelve
+microtopografía, así que un valor de celda no equivale a un predio; termina en
+2021-12-31, sin años recientes.
+
+## 3. Los archivos recortados están completos
+
+```{r}
+#| label: archivos
+arch <- list.files(dir_cr2met, "^CR2MET.*\\.nc$", recursive = TRUE, full.names = TRUE)
+info <- data.frame(archivo = basename(arch))
+info$variable <- ifelse(grepl("_pr_", info$archivo, fixed = TRUE), "pr", "tmin_tmax")
+info$mes <- sub(".*_day_([0-9]{4}_[0-9]{2})_.*", "\\1", info$archivo)
+
+resumen <- do.call(rbind, lapply(split(info, info$variable), function(d)
+  data.frame(variable = d$variable[1], n_archivos = nrow(d),
+             desde = min(d$mes), hasta = max(d$mes))))
+knitr::kable(resumen, row.names = FALSE)
+
+n_esp <- par$recorte$n_archivos_esperado
+chequear("744 archivos mensuales por variable (1960-01 a 2021-12)",
+         all(resumen$n_archivos == n_esp) && nrow(resumen) == 2 &&
+           all(resumen$desde == "1960_01") && all(resumen$hasta == "2021_12"),
+         paste(resumen$variable, resumen$n_archivos, collapse = " · "))
+chequear("Sin temporales '~' de un recorte interrumpido",
+         !any(grepl("^~", basename(list.files(dir_cr2met, recursive = TRUE)))))
+```
+
+## 4. Lectura del recorte
+
+```{r}
+#| label: lectura
+tmin <- leer_cr2met(dir_cr2met, "tmin", ini, fin)
+tmax <- leer_cr2met(dir_cr2met, "tmax", ini, fin)
+pr   <- leer_cr2met(dir_cr2met, "pr",   ini, fin)
+
+n_dias <- as.integer(as.Date(fin) - as.Date(ini)) + 1
+cat("Extent :", as.vector(ext(tmin)), "\nCRS    :", crs(tmin, describe = TRUE)$code,
+    "\nRes    :", res(tmin), "\nCeldas :", nrow(tmin), "x", ncol(tmin),
+    "\nCapas  :", nlyr(tmin), "(esperadas", n_dias, ")\n")
+
+ext_esp <- unlist(par$recorte$extent_esperado)
+chequear("Extent del recorte = esperado (xmin, xmax, ymin, ymax)",
+         isTRUE(all.equal(unname(as.vector(ext(tmin))), unname(ext_esp), tolerance = 1e-6)),
+         paste(as.vector(ext(tmin)), collapse = ", "))
+chequear("CRS geográfico WGS84 y resolución 0,05°",
+         is.lonlat(tmin) && isTRUE(all.equal(res(tmin), c(0.05, 0.05))))
+chequear("Tmin, Tmax y pr comparten grilla",
+         compareGeom(tmin, tmax, stopOnError = FALSE) &&
+           compareGeom(tmin, pr, stopOnError = FALSE))
+chequear("Una capa por día del período de validación",
+         nlyr(tmin) == n_dias && nlyr(tmax) == n_dias && nlyr(pr) == n_dias,
+         paste(nlyr(tmin), nlyr(tmax), nlyr(pr), "de", n_dias))
+```
+
+```{r}
+#| label: mapa
+#| fig-height: 4.5
+#| fig-cap: "Tmin media del período de validación en la ventana recortada; el punto rojo es Colliguay."
+plot(mean(tmin), main = "Tmin media (°C)")
+points(lon, lat, pch = 19, col = "red", cex = 1.2)
+chequear("Colliguay cae dentro del recorte",
+         lon > xmin(tmin) && lon < xmax(tmin) && lat > ymin(tmin) && lat < ymax(tmin))
+```
+
+## 5. Serie diaria en el punto de control
+
+```{r}
+#| label: serie
+d <- Reduce(function(a, b) merge(a, b, by = "fecha"),
+            list(serie_punto(tmin, lon, lat, "tmin"),
+                 serie_punto(tmax, lon, lat, "tmax"),
+                 serie_punto(pr,   lon, lat, "pr")))
+summary(d[, c("tmin", "tmax", "pr")])
+
+chequear("Serie sin NA y sin fechas repetidas",
+         !anyNA(d[, c("tmin", "tmax", "pr")]) && !anyDuplicated(d$fecha))
+chequear("Fechas diarias continuas en todo el período",
+         nrow(d) == n_dias && all(diff(d$fecha) == 1))
+chequear("Tmin <= Tmax en todos los días", all(d$tmin <= d$tmax))
+chequear("Pr >= 0", all(d$pr >= 0))
+chequear("Rangos plausibles (Tmin > -25 °C, Tmax < 45 °C)",
+         min(d$tmin) > -25 && max(d$tmax) < 45,
+         sprintf("Tmin %.1f a %.1f · Tmax %.1f a %.1f",
+                 min(d$tmin), max(d$tmin), min(d$tmax), max(d$tmax)))
+```
+
+## 6. Métricas con las funciones de `R/`
+
+```{r}
+#| label: metricas
+h <- dias_helada(d, par$heladas$umbrales)
+h_anual <- totales_periodo(h, "helada", grupos = "umbral", por_mes = FALSE)
+
+c_ <- dias_sobre_umbral(d, par$calor$umbrales)
+c_anual <- totales_periodo(c_, "supera", grupos = "umbral", por_mes = FALSE)
+
+resumen_umbral <- function(x, col, etiqueta) {
+  a <- aggregate(x[[col]], list(umbral = x$umbral), function(v)
+    c(media = mean(v), min = min(v), max = max(v)))
+  data.frame(umbral = a$umbral, media = a$x[, "media"], min = a$x[, "min"],
+             max = a$x[, "max"], row.names = NULL)
+}
+tab_h <- resumen_umbral(h_anual, "helada", "helada")
+tab_c <- resumen_umbral(c_anual, "supera", "supera")
+
+pr_anual <- aggregate(pr ~ anio, transform(d, anio = as.integer(format(fecha, "%Y"))), sum)
+dias_lluvia <- aggregate(pr >= par$precipitacion$dia_lluvia_mm ~ anio,
+                         transform(d, anio = as.integer(format(fecha, "%Y"))), sum)
+```
+
+**Días de helada por año (Tmin ≤ umbral)**
+
+```{r}
+knitr::kable(tab_h, digits = 1, col.names = c("Umbral (°C)", "Media", "Mín", "Máx"))
+```
+
+**Días cálidos por año (Tmax > umbral)**
+
+```{r}
+knitr::kable(tab_c, digits = 1, col.names = c("Umbral (°C)", "Media", "Mín", "Máx"))
+```
+
+**Precipitación anual**
+
+```{r}
+cat(sprintf("Media %.0f mm · mín %.0f · máx %.0f · días con lluvia (≥ %s mm): %.0f por año\n",
+            mean(pr_anual$pr), min(pr_anual$pr), max(pr_anual$pr),
+            par$precipitacion$dia_lluvia_mm, mean(dias_lluvia[[2]])))
+```
+
+```{r}
+#| label: fig-heladas
+#| fig-height: 5
+#| fig-cap: "Días de helada por año en el punto de control, por umbral."
+h_anual$umbral_f <- factor(paste0("≤ ", h_anual$umbral, " °C"),
+                           levels = paste0("≤ ", sort(unique(h_anual$umbral), decreasing = TRUE), " °C"))
+ggplot(h_anual, aes(anio, helada)) +
+  geom_col(fill = "#3b6ea5") +
+  facet_wrap(~ umbral_f, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = "Días por año") +
+  tema_informe()
+```
+
+```{r}
+chequear("Días de helada no crecen al bajar el umbral (monotonía)",
+         all(diff(tab_h$media[order(-tab_h$umbral)]) <= 1e-9))
+chequear("Precipitación anual media plausible para la zona (100–1500 mm)",
+         mean(pr_anual$pr) > 100 && mean(pr_anual$pr) < 1500,
+         sprintf("%.0f mm", mean(pr_anual$pr)))
+```
+
+## 7. Contraste con el estudio de referencia (`paltos_quilpue`)
+
+El recorte de `paltos_quilpue` (`data/processed/cr2met_*_contexto.nc`) sale de los
+mismos netCDF originales. En la celda de Colliguay ambas series deben coincidir.
+Este chequeo se omite si el repositorio de referencia no está junto a este.
+
+```{r}
+#| label: contraste
+dir_pq <- normalizePath(file.path(here::here(), par$rutas$paltos_processed), mustWork = FALSE)
+f_pq <- file.path(dir_pq, sprintf("cr2met_%s_contexto.nc", c("tmin", "tmax", "pr")))
+
+if (all(file.exists(f_pq))) {
+  comp <- lapply(c("tmin", "tmax", "pr"), function(v) {
+    ref <- serie_punto(rast(f_pq[c("tmin", "tmax", "pr") == v]), lon, lat, "ref")
+    m <- merge(ref, d[, c("fecha", v)], by = "fecha")
+    data.frame(variable = v, dias_comunes = nrow(m),
+               dif_max_abs = max(abs(m$ref - m[[v]])))
+  })
+  comp <- do.call(rbind, comp)
+  knitr::kable(comp, digits = 6)
+  chequear("Serie idéntica al recorte de paltos_quilpue en Colliguay (dif. máx. < 1e-4)",
+           all(comp$dias_comunes > 0) && all(comp$dif_max_abs < 1e-4),
+           paste(comp$variable, comp$dias_comunes, "días", collapse = " · "))
+} else {
+  cat("No encontré", dir_pq, "— contraste omitido.\n")
+}
+```
+
+## 8. Resultado
+
+```{r}
+#| label: resultado
+knitr::kable(chequeos, col.names = c("Chequeo", "OK", "Detalle"))
+if (all(chequeos$ok)) {
+  cat("\n**Flujo validado:** el recorte se lee bien y las métricas salen coherentes. ",
+      "Se puede avanzar al paso 3 (modularizar) y al prototipo Shiny.\n")
+} else {
+  cat("\n**Hay chequeos fallidos:** revisar antes de avanzar.\n")
+}
+```

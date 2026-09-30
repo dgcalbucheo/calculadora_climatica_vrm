@@ -1,0 +1,26 @@
+# Datos crudos (recorte CR2MET): no se versionan; se regeneran desde la fuente
+data/raw/
+
+# Rasters procesados pesados
+data/processed/*.tif
+data/processed/celdas*/
+
+# Salidas de render de Quarto
+analisis/*.html
+analisis/*_files/
+.quarto/
+output/prueba*/
+
+# R / RStudio / renv
+.Rproj.user/
+.Rhistory
+.RData
+renv/library/
+renv/staging/
+.Rproj.user
+.httr-oauth
+.DS_Store
+.quarto
+deploy_app/
+rsconnect/
+output/informes/

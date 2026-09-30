@@ -1,0 +1,46 @@
+# Parámetros compartidos por todos los análisis (analisis/*.qmd)
+# Leer con: par <- yaml::read_yaml(here::here("parametros.yml"), fileEncoding = "UTF-8")
+
+proyecto: "Calculadora climática Valparaíso + RM (prototipo)"
+
+# Punto de control: Colliguay, en el centro de su celda CR2MET. Da la misma serie que el
+# punto exacto usado en el estudio de referencia (paltos_quilpue): ambos caen en esa celda.
+# Sirve para validar el flujo contra el análisis ya hecho.
+punto_control:
+  nombre: "Colliguay (punto de control)"
+  lon: -71.325
+  lat: -33.175
+
+# Recorte de CR2MET (data/raw/cr2met): regiones de Valparaíso (5) y Metropolitana (13),
+# parte continental (sin Isla de Pascua ni Juan Fernández), margen 0,1° y ajuste a la grilla.
+recorte:
+  cod_regiones: [5, 13]
+  margen_grados: 0.1
+  extent_esperado: [-71.95, -69.65, -34.40, -31.90]   # xmin, xmax, ymin, ymax (WGS84)
+  n_archivos_esperado: 744                            # por variable (1960-01 a 2021-12)
+
+# Fuente: CR2MET v2.5 llega a 2021-12-31
+periodo:
+  completo:
+    inicio: "1960-01-01"
+    fin:    "2021-12-31"
+  validacion:            # 20 años, igual que el período principal de paltos_quilpue
+    inicio: "2002-01-01"
+    fin:    "2021-12-31"
+
+heladas:
+  umbrales: [0, -1, -2, -3, -4]   # °C, helada si Tmin <= umbral
+calor:
+  umbrales: [25, 30, 33, 35, 36]  # °C, día cálido si Tmax > umbral
+precipitacion:
+  dia_lluvia_mm: 1                # día con lluvia si pr >= 1 mm
+
+rutas:
+  raw:        "data/raw"
+  processed:  "data/processed"
+  tablas:     "output/tablas"
+  figuras:    "output/figuras"
+  # Opcional: carpeta data/processed del estudio de referencia, para el contraste de
+  # analisis/00_validacion_recorte.qmd (vacío = se omite). Ruta local; no subir rutas personales.
+  paltos_processed:  ""
+  mascara:    "data/processed/cobertura_vrm.gpkg"

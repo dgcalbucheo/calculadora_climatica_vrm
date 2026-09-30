@@ -1,0 +1,178 @@
+---
+title: "01 · Motor por celda y control de Colliguay"
+subtitle: "Calculadora climática Valparaíso + RM — datos consolidados por celda, fuentes y limitaciones"
+lang: es
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Qué documenta este notebook
+
+La app (`app.R`) no lee los netCDF de CR2MET: lee **un archivo pequeño por celda**
+de la grilla, generado una sola vez por `consolidar_cr2met_por_celda()`. Este notebook
+deja escrito **por qué** se hizo así, **qué supone** el cálculo, **qué no resuelve**
+y comprueba que el resultado por celda reproduce el de `paltos_quilpue`
+(punto de control Colliguay). Se renderiza después de consolidar.
+
+```{r}
+#| label: setup
+library(ggplot2)
+invisible(lapply(list.files(here::here("R"), "\\.R$", full.names = TRUE), source))
+
+par  <- yaml::read_yaml(here::here("parametros.yml"), fileEncoding = "UTF-8")
+dir_celdas <- here::here(par$rutas$processed, "celdas")
+dir_raw    <- here::here(par$rutas$raw, "cr2met")
+lon <- par$punto_control$lon
+lat <- par$punto_control$lat
+ini <- par$periodo$validacion$inicio
+fin <- par$periodo$validacion$fin
+
+chequeos <- data.frame(chequeo = character(), ok = logical(), detalle = character())
+chequear <- function(chequeo, ok, detalle = "") {
+  chequeos[nrow(chequeos) + 1, ] <<- list(chequeo, isTRUE(ok), detalle)
+  invisible(ok)
+}
+mensaje <- function(expr) tryCatch({ expr; NA_character_ }, error = function(e) conditionMessage(e))
+```
+
+## 2. Fuente y definiciones
+
+| | |
+|---|---|
+| Producto | CR2MET v2.5 — Boisier, J.P. (2023). *CR2MET: A high-resolution precipitation and temperature dataset for the period 1960-2021 in continental Chile* |
+| Origen | Centro de Ciencia del Clima y la Resiliencia (CR2), Universidad de Chile |
+| DOI / licencia | 10.5281/zenodo.7529682 · CC BY 4.0 (se pueden publicar datos derivados con atribución) |
+| Variables / período | Precipitación diaria, Tmin y Tmax diarias · 1960-01-01 a 2021-12-31 |
+| Resolución | Grilla de 0,05° (~5,6 km N–S × ~4,7 km E–W ≈ 26 km² por celda) |
+
+Definiciones usadas por `tablas_salidas()`:
+
+- **Día de helada:** Tmin ≤ umbral (0, −1, −2, −3, −4 °C).
+- **Día cálido:** Tmax > umbral (25, 30, 33, 35, 36 °C).
+- **Día de lluvia:** pr ≥ 1 mm. Tmed = (Tmin + Tmax) / 2.
+- **Climatologías y totales anuales:** solo con **años completos** (enero a diciembre) dentro del período pedido; los años parciales se descartan y se informan.
+
+## 3. Diseño: una celda, un archivo
+
+1. **Fase de construcción (con `terra`, una vez):** se leen los netCDF, se seleccionan las celdas que **tocan** el polígono de cobertura (comunas de las regiones 5 y 13, continente) y se escribe `celda_NNNNNN.rds` con Tmin, Tmax y pr como **enteros × 1000** (compresión xz), más `indice.csv` y `grilla.rds`.
+2. **Fase de consulta (R base, sin `terra`):** la celda de un punto se calcula por aritmética sobre la grilla, `celda = (fila − 1) · ncol + columna`, con `fila` contada desde el norte. Se lee su archivo y se recorta por fechas.
+
+Consecuencias que conviene tener presentes:
+
+- **Precisión:** al guardar enteros ×1000, la diferencia máxima respecto de la lectura con `terra` es ≤ 0,0005 (°C o mm). Un día con Tmin justo en un umbral puede cambiar de lado al redondear; en promedios de 20 años el efecto es despreciable, pero no es idéntico bit a bit.
+- **Cobertura:** la grilla tiene valores sobre el mar cercano y sobre Argentina. La máscara es el conjunto de celdas del índice; una celda costera que toca el polígono solo en parte se acepta.
+- **Sin `terra` en la app:** simplifica el despliegue (ver README).
+
+## 4. Limitaciones que hay que decir siempre
+
+- Un valor es el de una **celda de ~26 km²**, no el de un predio. CR2MET no resuelve el drenaje de aire frío (fondo de valle vs. ladera), que es el proceso que más pesa en heladas.
+- Es un producto **modelado y calibrado con estaciones**: comparar con esas mismas estaciones no es una validación independiente.
+- Termina en 2021-12-31; sin años recientes.
+- Contexto topográfico (elevación, TPI, diferencia con el promedio de la celda) y ajuste con estaciones o loggers locales son módulos futuros, no parte de este motor.
+
+## 5. Chequeos de los datos consolidados
+
+```{r}
+#| label: grilla
+g <- readRDS(file.path(dir_celdas, "grilla.rds"))
+ind <- read.csv(file.path(dir_celdas, "indice.csv"))
+arch <- file.path(dir_celdas, ind$archivo)
+tam_mb <- sum(file.size(arch), na.rm = TRUE) / 1e6
+
+knitr::kable(data.frame(
+  concepto = c("Celdas en el índice", "Tamaño total (MB)", "KB por celda",
+               "Período", "Grilla (filas × columnas)", "Resolución (°)"),
+  valor = c(nrow(ind), sprintf("%.1f", tam_mb), sprintf("%.0f", 1000 * tam_mb / nrow(ind)),
+            paste(g$fecha_ini, "a", g$fecha_fin), paste(g$nrow, "×", g$ncol), round(g$res, 4))),
+  col.names = c("", ""))
+
+chequear("Índice sin celdas repetidas y con n = n_celdas de la grilla",
+         !anyDuplicated(ind$celda) && nrow(ind) == g$n_celdas, paste(nrow(ind), "celdas"))
+chequear("Todos los archivos del índice existen", all(file.exists(arch)))
+chequear("Período consolidado = período completo del yml",
+         identical(as.character(g$fecha_ini), par$periodo$completo$inicio) &&
+           identical(as.character(g$fecha_fin), par$periodo$completo$fin))
+```
+
+```{r}
+#| label: mapa
+#| fig-height: 5
+#| fig-cap: "Centros de las celdas consolidadas (cobertura de la calculadora); el punto rojo es Colliguay."
+ggplot(ind, aes(lon, lat)) +
+  geom_point(size = 0.6, colour = "#3b6ea5") +
+  annotate("point", x = lon, y = lat, colour = "red", size = 2.5) +
+  coord_quickmap() +
+  labs(x = NULL, y = NULL) +
+  tema_informe()
+```
+
+## 6. Control de Colliguay (mismo punto y valores que `paltos_quilpue`)
+
+```{r}
+#| label: colliguay
+d <- serie_clima_celda(lon, lat, ini, fin, dir_celdas)
+m <- metricas_punto(d)
+h <- resumen_por_umbral(m$helada, "helada")
+celda <- unname(attr(d, "celda"))[1:2]
+
+esp <- c(helada_0 = 2.15, helada_m1 = 0.35, pr_anual_mm = 364.0, dias_lluvia = 32.8)
+obs <- c(helada_0 = h$media[h$umbral == 0], helada_m1 = h$media[h$umbral == -1],
+         pr_anual_mm = mean(m$precip$pr_mm), dias_lluvia = mean(m$precip$dias_lluvia))
+tol <- c(0.01, 0.01, 0.1, 0.05)
+knitr::kable(data.frame(esperado = esp, observado = obs, dif = obs - esp, tolerancia = tol),
+             digits = 3)
+chequear("Celda de Colliguay = (-71,325; -33,175)", isTRUE(all.equal(celda, c(-71.325, -33.175))))
+chequear("Heladas, precipitación y días de lluvia = valores de paltos_quilpue",
+         all(abs(obs - esp) <= tol), paste(round(obs, 2), collapse = " · "))
+```
+
+```{r}
+#| label: contraste
+#| eval: !expr file.exists(dir_raw)
+# Solo si el raw está en este equipo: lectura por celda vs. lectura directa con terra
+a <- serie_clima_punto(lon, lat, ini, fin, dir_raw)
+dif <- max(abs(a$tmin - d$tmin), abs(a$tmax - d$tmax), abs(a$pr - d$pr), na.rm = TRUE)
+cat(sprintf("Diferencia máxima celda vs. terra: %.5f\n", dif))
+chequear("Celda vs. terra: filas iguales, mismos NA y dif. máx. ≤ 5e-4",
+         nrow(a) == nrow(d) && identical(is.na(a$tmin), is.na(d$tmin)) && dif <= 5e-4,
+         sprintf("dif. máx. %.5f", dif))
+```
+
+## 7. Errores esperados
+
+La app muestra estos mensajes tal cual; aquí se comprueba que salen.
+
+```{r}
+#| label: errores
+casos <- list(
+  "Mar (Valparaíso)"          = quote(serie_clima_celda(-71.9, -33.5, ini, fin, dir_celdas)),
+  "Argentina"                 = quote(serie_clima_celda(-69.7, -33.5, ini, fin, dir_celdas)),
+  "Fuera de la grilla"        = quote(serie_clima_celda(-109, -27, ini, fin, dir_celdas)),
+  "Fechas invertidas"         = quote(serie_clima_celda(lon, lat, fin, ini, dir_celdas)),
+  "Período fuera de rango"    = quote(serie_clima_celda(lon, lat, "2030-01-01", "2030-12-31", dir_celdas)),
+  "Coordenada no numérica"    = quote(serie_clima_celda("a", lat, ini, fin, dir_celdas))
+)
+msj <- vapply(casos, function(e) { r <- mensaje(eval(e)); if (is.na(r)) "(sin error)" else r },
+              character(1))
+knitr::kable(data.frame(caso = names(msj), mensaje = unname(msj)))
+chequear("Los 6 casos inválidos devuelven un error en español", all(msj != "(sin error)"))
+```
+
+## 8. Resultado
+
+```{r}
+#| label: resultado
+knitr::kable(chequeos, col.names = c("Chequeo", "OK", "Detalle"))
+if (all(chequeos$ok)) {
+  cat("\n**Motor por celda validado:** reproduce el control de Colliguay. ",
+      "La app puede usarlo como fuente de datos.\n")
+} else {
+  cat("\n**Hay chequeos fallidos:** revisar antes de usar la app.\n")
+}
+```

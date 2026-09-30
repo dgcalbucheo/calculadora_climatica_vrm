@@ -1,0 +1,226 @@
+---
+title: "Informe climático por punto"
+subtitle: "Heladas, temperatura y precipitación · CR2MET v2.5 · Regiones de Valparaíso y Metropolitana"
+lang: es
+format:
+  html:
+    toc: true
+    toc-title: "Contenido"
+    embed-resources: true
+    fig-width: 9
+    fig-height: 4.5
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  nombre: null            # nombre del predio o punto; NULL = punto de control de parametros.yml
+  lon: null               # longitud WGS84; NULL = punto de control
+  lat: null               # latitud WGS84; NULL = punto de control
+  fecha_ini: null         # "AAAA-MM-DD"; NULL = período de validación de parametros.yml
+  fecha_fin: null
+  umbrales_helada: [0, -2, -4]   # °C: helada si Tmin <= umbral
+  umbrales_calor: [30, 35]       # °C: día cálido si Tmax > umbral
+  notas: ""               # texto interpretativo opcional (se imprime como sección propia)
+---
+
+<!--
+Informe estático de UN punto, con el mismo motor que la app (R/). Se ejecuta desde el
+computador, no en el servidor. Desde la raíz del proyecto:
+
+quarto::quarto_render("analisis/02_informe_punto.qmd", output_file = "informe_mi_predio.html",
+  execute_params = list(nombre = "Mi predio", lon = -71.0, lat = -33.0,
+                        fecha_ini = "2002-01-01", fecha_fin = "2021-12-31",
+                        umbrales_helada = c(0, -2, -4), umbrales_calor = c(30, 35),
+                        notas = "Texto para el cliente."))
+
+Sin parámetros usa el punto de control y el período de validación de parametros.yml.
+El HTML queda en analisis/ (ignorado por git): moverlo a output/informes/ (ignorado).
+-->
+
+```{r}
+#| label: setup
+library(ggplot2)
+invisible(lapply(list.files(here::here("R"), "\\.R$", full.names = TRUE), source))
+
+par <- yaml::read_yaml(here::here("parametros.yml"), fileEncoding = "UTF-8")
+usar <- function(x, por_defecto) if (is.null(x) || (length(x) == 1 && is.na(x))) por_defecto else x
+
+nombre <- usar(params$nombre, par$punto_control$nombre)
+lon    <- as.numeric(usar(params$lon, par$punto_control$lon))
+lat    <- as.numeric(usar(params$lat, par$punto_control$lat))
+ini    <- as.character(usar(params$fecha_ini, par$periodo$validacion$inicio))
+fin    <- as.character(usar(params$fecha_fin, par$periodo$validacion$fin))
+umb_h  <- sort(as.numeric(unlist(params$umbrales_helada)), decreasing = TRUE)
+umb_c  <- sort(as.numeric(unlist(params$umbrales_calor)))
+notas  <- trimws(paste(usar(params$notas, ""), collapse = "\n"))
+if (length(umb_h) == 0 || length(umb_c) == 0)
+  stop("Definir al menos un umbral de helada y uno de día cálido", call. = FALSE)
+
+dir_celdas <- here::here(par$rutas$processed, "celdas")
+
+# Los errores de la consulta (mar, fuera de cobertura, fechas) salen en español y detienen el render
+serie <- serie_clima_celda(lon, lat, ini, fin, dir_celdas)
+res   <- tablas_salidas(serie, umbrales_helada = umb_h, umbrales_calor = umb_c,
+                        dia_lluvia_mm = par$precipitacion$dia_lluvia_mm)
+meta  <- res$meta
+celda <- unname(attr(serie, "celda"))[1:2]
+meses <- c("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic")
+```
+
+## 1. Punto y período
+
+```{r}
+#| label: punto
+knitr::kable(data.frame(
+  concepto = c("Punto", "Coordenada pedida (WGS84)", "Centro de la celda CR2MET usada",
+               "Período pedido", "Años completos usados",
+               if (length(meta$anios_descartados)) "Años parciales descartados",
+               "Generado"),
+  valor = c(nombre, sprintf("lon %.5f, lat %.5f", lon, lat),
+            sprintf("lon %.3f, lat %.3f", celda[1], celda[2]),
+            paste(ini, "a", fin), meta$periodo_txt,
+            if (length(meta$anios_descartados)) paste(meta$anios_descartados, collapse = ", "),
+            format(Sys.Date(), "%d-%m-%Y"))),
+  col.names = c("", ""))
+```
+
+```{r}
+#| label: mapa
+#| fig-height: 4.2
+#| fig-cap: "Punto pedido (rojo) y celda CR2MET usada (recuadro). En gris, los centros de las celdas de cobertura."
+g   <- readRDS(file.path(dir_celdas, "grilla.rds"))
+ind <- read.csv(file.path(dir_celdas, "indice.csv"))
+mitad <- g$res / 2
+ggplot(ind, aes(lon, lat)) +
+  geom_point(size = 0.4, colour = "grey70") +
+  annotate("rect", xmin = celda[1] - mitad, xmax = celda[1] + mitad,
+           ymin = celda[2] - mitad, ymax = celda[2] + mitad,
+           fill = NA, colour = "#3b6ea5", linewidth = 0.6) +
+  annotate("point", x = lon, y = lat, colour = "red", size = 2.5) +
+  coord_quickmap() +
+  labs(x = NULL, y = NULL) +
+  tema_informe()
+```
+
+**Cómo leer este informe:** el valor es el de la celda completa (~5,6 × 4,7 km, unos 26 km²);
+todos los puntos de una misma celda dan la misma serie. No representa el predio ni el
+drenaje de aire frío (ver «Fuente, definiciones y limitaciones»).
+
+## 2. Cifras clave
+
+```{r}
+#| label: cifras
+h  <- res$heladas_resumen
+pa <- res$precip_anual
+tm <- res$temperatura_mensual
+mes_frio <- tm[which.min(tm$tmin_media), ]
+
+cifras <- data.frame(
+  indicador = c(
+    sprintf("Días de helada por año (Tmin ≤ %g °C)", h$umbral),
+    "Precipitación anual media (mm)",
+    "Días de lluvia por año (media)",
+    sprintf("Mes más frío: %s (Tmin media, °C)", meses[mes_frio$mes])),
+  valor = c(sprintf("%.1f", h$media),
+            sprintf("%.0f", mean(pa$pr_mm)),
+            sprintf("%.1f", mean(pa$dias_lluvia)),
+            sprintf("%.1f", mes_frio$tmin_media)))
+knitr::kable(cifras, col.names = c("Indicador", paste("Media", meta$periodo_txt)))
+```
+
+```{r}
+#| label: notas
+#| results: asis
+if (nzchar(notas)) cat("## Interpretación\n\n", notas, "\n\n", sep = "")
+```
+
+## 3. Heladas
+
+Un día de helada es un día con Tmin menor o igual al umbral.
+
+```{r}
+#| label: heladas-anual
+grafico_heladas_anual(res)
+```
+
+```{r}
+#| label: heladas-tabla
+x <- res$heladas_resumen
+x$umbral <- as.character(etiqueta_umbral(x$umbral))
+knitr::kable(etiquetar_columnas(x), digits = 1,
+             caption = "Días de helada por año: media, mínimo y máximo del período.")
+```
+
+```{r}
+#| label: heladas-mensual
+grafico_heladas_mensual(res)
+```
+
+```{r}
+#| label: heladas-temporada
+grafico_temporada_heladas(res)
+```
+
+## 4. Temperatura
+
+```{r}
+#| label: temperatura
+grafico_temperatura_mensual(res)
+```
+
+```{r}
+#| label: calor
+grafico_dias_calidos_anual(res)
+```
+
+```{r}
+#| label: calor-tabla
+x <- res$calor_resumen
+x$umbral <- as.character(etiqueta_umbral_calor(x$umbral))
+knitr::kable(etiquetar_columnas(x), digits = 1,
+             caption = "Días cálidos por año (Tmax sobre el umbral): media, mínimo y máximo.")
+```
+
+## 5. Precipitación
+
+```{r}
+#| label: precip-mensual
+grafico_precipitacion_mensual(res)
+```
+
+```{r}
+#| label: precip-anual
+grafico_precipitacion_anual(res)
+```
+
+## 6. Fuente, definiciones y limitaciones
+
+Texto único de la calculadora (el mismo `LEAME` que acompaña las exportaciones de la app).
+
+```{r}
+#| label: leame
+#| results: asis
+l <- leame_exportacion(res)
+l <- l[match("FUENTE", l):length(l)]
+cerca <- strrep("`", 3)
+cat(cerca, "text\n", paste(l, collapse = "\n"), "\n", cerca, "\n", sep = "")
+```
+
+### Lo que este informe no incluye
+
+- **Contexto topográfico del punto** (elevación, TPI, diferencia con el promedio de la celda).
+- **Contraste con estaciones cercanas** (DMC, Agromet). Es la vía creíble para cuantificar la
+  diferencia entre fondo de valle y ladera, con al menos un invierno de datos locales.
+  CR2MET se calibró con estaciones: compararlo con las mismas no es una validación independiente.
+- **Años posteriores a 2021** (CR2MET termina el 2021-12-31).
+- **Indicadores por cultivo** (horas de frío, grados-día, riesgo de helada en floración).
+
+---
+
+```{r}
+#| label: pie
+#| results: asis
+cat(sprintf("Generado el %s con %s. Motor: funciones de `R/` del repositorio calculadora_climatica_vrm (versión 1, prototipo).",
+            format(Sys.Date(), "%d-%m-%Y"), R.version.string))
+```
